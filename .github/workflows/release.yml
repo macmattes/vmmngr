@@ -14,8 +14,13 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     env:
-      REGISTRY: ${{ secrets.REGISTRY }}
-      REGISTRY_REPO: ${{ secrets.REGISTRY_REPO }}
+      # optional overrides (repository variables, usually empty):
+      #   REGISTRY       registry host            (default ghcr.io)
+      #   REGISTRY_REPO  image path              (default $GITHUB_REPOSITORY)
+      # credentials are only needed for a registry other than GHCR -
+      # those go into the secrets REGISTRY_USER / REGISTRY_TOKEN
+      REGISTRY: ${{ vars.REGISTRY }}
+      REGISTRY_REPO: ${{ vars.REGISTRY_REPO }}
       REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
       REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
     steps:

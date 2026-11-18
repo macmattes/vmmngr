@@ -130,15 +130,21 @@ The workflow `.github/workflows/release.yml` runs on tags `v*` or manually:
 3. pushes it as OCI artifact to `ghcr.io/<owner>/<repo>:<version>` and `:latest`
    using `oras`
 
-On GitHub no configuration is needed - the push authenticates with the built-in
-`GITHUB_TOKEN` and `packages: write`. Optional overrides:
+On GitHub **nothing has to be configured**: the push authenticates with the
+built-in `GITHUB_TOKEN` (`packages: write`) and targets `ghcr.io/$GITHUB_REPOSITORY`.
 
-| Secret | Default | Purpose |
-|---|---|---|
-| `REGISTRY` | `ghcr.io` | registry host |
-| `REGISTRY_REPO` | `$GITHUB_REPOSITORY` | image path inside the registry |
-| `REGISTRY_USER` | `github.actor` | only needed for a registry other than GHCR |
-| `REGISTRY_TOKEN` | `GITHUB_TOKEN` | only needed for a registry other than GHCR |
+Only if you publish to a different registry, set these (all optional):
+
+| Name | Type | Default | Purpose |
+|---|---|---|---|
+| `REGISTRY` | repository variable | `ghcr.io` | registry host |
+| `REGISTRY_REPO` | repository variable | `$GITHUB_REPOSITORY` | image path inside the registry |
+| `REGISTRY_USER` | secret | `github.actor` | account for a non-GHCR registry |
+| `REGISTRY_TOKEN` | secret | `GITHUB_TOKEN` | token for a non-GHCR registry |
+
+Non-secret values are repository *variables* (`vars.*`), credentials are
+*secrets* (`secrets.*`) - that way an empty variable never looks like a missing
+credential.
 
 Release a new version:
 
