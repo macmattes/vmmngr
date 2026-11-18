@@ -4,7 +4,7 @@ A OneButton-style extension that puts **bhyve / vm-bhyve** under the XigmaNAS we
 list machines, start/stop them, create new ones, manage ISOs, templates, datastores and
 switches, and open a console or the graphical screen in the browser.
 
-Status: **0.10.1** – feature-complete for daily use on a single node.
+Status: **0.12.1** – feature-complete for daily use on a single node.
 
 ---
 
@@ -32,6 +32,8 @@ Status: **0.10.1** – feature-complete for daily use on a single node.
 - `vmm.ko` and `nmdm.ko`
 - optional: `pkg install novnc py312-websockify` for the graphical browser console
 - optional: `ttyd` for the serial web terminal (bundled or from pkg)
+- network: VNC `5900+`, noVNC `6080-6099`, serial terminal `7681-7699` (bound to the
+  VM bridge IP)
 
 The addon never installs or upgrades vm-bhyve itself. `vm_source = auto` prefers the
 system installation and only fills gaps from the bundled tree.
@@ -62,7 +64,7 @@ See [`docs/onebutton.md`](docs/onebutton.md) - includes the ready-made
 
 ```sh
 mkdir -p -m 0750 /mnt/tank/extensions/vmmngr && cd /mnt/tank/extensions/vmmngr
-fetch https://raw.githubusercontent.com/yourname/vmmngr/main/vmm-init
+fetch https://raw.githubusercontent.com/macmattes/vmmngr/main/vmm-init
 chmod +x vmm-init && ./vmm-init -o
 ```
 
@@ -73,7 +75,7 @@ Then open **Extensions → VM Manager → Setup** and follow the wizard.
 The release workflow publishes the tarball as an OCI artifact:
 
 ```sh
-oras pull ghcr.io/yourname/vmmngr:latest
+oras pull ghcr.io/macmattes/vmmngr:latest
 tar -xzf vmmngr-*.tar.gz -C /mnt/tank/extensions/
 cd /mnt/tank/extensions/vmmngr && ./vmm-init -o
 ```
@@ -86,6 +88,9 @@ cd /mnt/tank/extensions/vmmngr && ./vmm-init -o
 2. **Datastore** – pick a mounted dataset below `/mnt` or create one; writes `vm_dir`
    and `vm_enable` to `config.xml`, applies them to the running system and runs `vm init`
 3. **Switch** – create the first `manual` switch on an existing host bridge
+4. **Register** – `Configuration → Register in config.xml` writes the postinit hook
+   and the `vmm_load`/`nmdm_load` entries into `config.xml` (the only place that
+   survives a reboot)
 
 ## How it works
 
@@ -118,30 +123,33 @@ cd /mnt/tank/extensions/vmmngr && ./vmm-init -o
 ./tools/build-package.sh      # -> dist/vmmngr-<version>.tar.gz (+ .sha256)
 ```
 
-The Gitea workflow `.gitea/workflows/release.yaml` runs on tags `v*` or manually:
+The workflow `.github/workflows/release.yml` runs on tags `v*` or manually:
 
 1. builds the tarball
 2. uploads it as a workflow artifact
-3. pushes it as OCI artifact to `ghcr.io/<owner>/vmmngr:<version>`
-   and `:latest` using `oras`
+3. pushes it as OCI artifact to `ghcr.io/<owner>/<repo>:<version>` and `:latest`
+   using `oras`
 
-Repository secrets (all optional except the credentials):
+On GitHub no configuration is needed - the push authenticates with the built-in
+`GITHUB_TOKEN` and `packages: write`. Optional overrides:
 
 | Secret | Default | Purpose |
 |---|---|---|
 | `REGISTRY` | `ghcr.io` | registry host |
-| `REGISTRY_REPO` | `<owner>/<repo>` (`GITHUB_REPOSITORY`) | image path inside the registry |
-| `REGISTRY_USER` | — (required) | account with write access to the repository |
-| `REGISTRY_TOKEN` | — (required) | password / access token for that account |
+| `REGISTRY_REPO` | `$GITHUB_REPOSITORY` | image path inside the registry |
+| `REGISTRY_USER` | `github.actor` | only needed for a registry other than GHCR |
+| `REGISTRY_TOKEN` | `GITHUB_TOKEN` | only needed for a registry other than GHCR |
 
-Unset values fall back to the defaults. On GitHub the push uses `GITHUB_TOKEN`, so no credentials have to be configured at all.
-
-Tagging a release:
+Release a new version:
 
 ```sh
-git tag -a v0.10.1 -m "vmmngr 0.10.1"
-git push origin v0.10.1
+git tag -a v0.12.1 -m "vmmngr 0.12.1"
+git push origin v0.12.1
 ```
+
+The GitHub release itself is created from the workflow artifact: upload
+`dist/vmmngr-<version>.tar.gz`, `dist/vmmngr-latest.tar.gz` and the `.sha256`
+file as release assets so the OBI entry can point at the stable name.
 
 ## Layout
 
@@ -154,6 +162,9 @@ gui/                     PHP pages, symlinked into /usr/local/www
 gui/ext/vmmngr/menu.inc  Extensions menu entry
 vendor/                  bundled binaries for systems without vm-bhyve
 tools/build-package.sh   packaging
+docs/                    OneButtonInstaller instructions
+.github/workflows/       release workflow (package + GHCR artifact)
+templates/               skeleton templates shipped with the extension
 state/ log/ backup/      runtime data (never shipped, never overwritten by updates)
 ```
 
