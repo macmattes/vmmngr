@@ -8,6 +8,16 @@ Status: **0.12.1** – feature-complete for daily use on a single node.
 
 ---
 
+## Screenshots
+
+| Dashboard | Create VM |
+|---|---|
+| ![Dashboard](docs/screenshots/dashboard.png) | ![Create VM](docs/screenshots/create-vm.png) |
+
+Guest names and datastore paths are masked in these shots.
+
+---
+
 ## Features
 
 | Area | What you get |
