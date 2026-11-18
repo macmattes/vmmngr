@@ -1,0 +1,88 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ${{ secrets.REGISTRY }}
+      REGISTRY_REPO: ${{ secrets.REGISTRY_REPO }}
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build package
+        run: |
+          chmod +x tools/build-package.sh
+          ./tools/build-package.sh
+          cat version.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmmngr-package
+          path: dist/
+
+      - name: Install oras
+        run: |
+          curl -sSL -o /tmp/oras.tgz \
+            https://github.com/oras-project/oras/releases/download/v1.2.0/oras_1.2.0_linux_amd64.tar.gz
+          tar -xzf /tmp/oras.tgz -C /tmp oras
+          sudo install -m 0755 /tmp/oras /usr/local/bin/oras
+          oras version
+
+      - name: Push to registry
+        run: |
+          set -eu
+          REGISTRY="${REGISTRY:-ghcr.io}"
+          REGISTRY_REPO="${REGISTRY_REPO:-$GITHUB_REPOSITORY}"
+
+          VERSION=$(cat version.txt | tr -d '\n')
+          PKG=$(ls dist/vmmngr-*.tar.gz | head -1)
+          PKG_SUM="${PKG}.sha256"
+          MEDIA="application/vnd.xigmanas.vmmngr.layer.v1.tar+gzip"
+
+          echo "registry : ${REGISTRY}"
+          echo "image    : ${REGISTRY}/${REGISTRY_REPO}"
+          echo "version  : ${VERSION}"
+
+          if [ -n "${REGISTRY_USER:-}" ] && [ -n "${REGISTRY_TOKEN:-}" ]; then
+            echo "$REGISTRY_TOKEN" | oras login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin
+          else
+            # GitHub packages: the built-in token is enough
+            echo "${{ secrets.GITHUB_TOKEN }}" | oras login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+          fi
+
+          for TAG in "$VERSION" latest; do
+            echo "pushing ${REGISTRY}/${REGISTRY_REPO}:${TAG}"
+            oras push "${REGISTRY}/${REGISTRY_REPO}:${TAG}" \
+              --artifact-type application/vnd.xigmanas.extension.v1 \
+              "$PKG:$MEDIA" \
+              "$PKG_SUM:application/vnd.xigmanas.sha256" \
+              --annotation "org.opencontainers.image.version=$VERSION" \
+              --annotation "org.opencontainers.image.title=vmmngr"
+          done
+
+      - name: Summary
+        run: |
+          REGISTRY="${REGISTRY:-ghcr.io}"
+          REGISTRY_REPO="${REGISTRY_REPO:-$GITHUB_REPOSITORY}"
+          VERSION=$(cat version.txt | tr -d '\n')
+          {
+            echo "### vmmngr ${VERSION}"
+            echo ""
+            echo "Package: \`dist/vmmngr-${VERSION}.tar.gz\`"
+            echo ""
+            echo "Pull: \`oras pull ${REGISTRY}/${REGISTRY_REPO}:${VERSION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

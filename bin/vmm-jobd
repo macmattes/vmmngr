@@ -1,0 +1,277 @@
+#!/usr/local/bin/php
+<?php
+/**
+ * vmm-jobd - executes exactly one queued VM job, then exits.
+ *
+ * Started detached by vmm-ctl. Owns the per-VM lock while it runs, streams
+ * stdout/stderr into state/jobs/<id>.log and records the final state.
+ */
+
+declare(strict_types=1);
+
+require_once __DIR__ . '/vmm-lib.php';
+
+$id = $argv[1] ?? '';
+$job = vmm_job_get($id);
+if ($job === null) {
+    fwrite(STDERR, "job not found: {$id}\n");
+    exit(2);
+}
+
+$verb = (string)$job['verb'];
+$name = (string)$job['vm'];
+$action = VMM_ACTIONS[$verb] ?? null;
+if ($action === null && (!isset($job['argv']) || !is_array($job['argv']) || $job['argv'] === [])) {
+    $job['state'] = 'failed';
+    $job['error'] = 'unknown verb';
+    $job['ended'] = time();
+    vmm_job_write($job);
+    exit(2);
+}
+
+$logFile = VMM_JOBDIR . '/' . $id . '.log';
+$log = fopen($logFile, 'ab');
+if ($log === false) {
+    exit(2);
+}
+
+function joblog($log, string $line): void
+{
+    fwrite($log, '[' . date('H:i:s') . '] ' . $line . "\n");
+    fflush($log);
+}
+
+// one lock per VM (destroy/start/stop of the same guest never overlap)
+vmm_ensure_state_dirs();
+$lockPath = VMM_LOCKDIR . '/' . preg_replace('/[^A-Za-z0-9._-]/', '_', $name) . '.lock';
+$lock = fopen($lockPath, 'c');
+if ($lock === false || !flock($lock, LOCK_EX | LOCK_NB)) {
+    $job['state'] = 'failed';
+    $job['error'] = 'another job holds the lock for this vm';
+    $job['ended'] = time();
+    vmm_job_write($job);
+    joblog($log, 'lock busy: ' . $lockPath);
+    fclose($log);
+    exit(3);
+}
+
+$job['state'] = 'running';
+$job['pid'] = getmypid();
+$job['started'] = time();
+vmm_job_write($job);
+
+$argvVm = isset($job['argv']) && is_array($job['argv']) && $job['argv'] !== []
+    ? $job['argv']
+    : array_merge($action['argv'], [$name]);
+joblog($log, 'start: vm ' . implode(' ', $argvVm));
+
+$vm = vmm_resolve('vm');
+if (!$vm['available']) {
+    $job['state'] = 'failed';
+    $job['error'] = 'vm-bhyve not available';
+    $job['ended'] = time();
+    vmm_job_write($job);
+    joblog($log, 'fatal: vm-bhyve not available');
+    flock($lock, LOCK_UN);
+    fclose($lock);
+    fclose($log);
+    exit(4);
+}
+
+$env = getenv() ?: [];
+$env['LC_ALL'] = 'C';
+$grub = vmm_resolve('grub');
+if ($grub['source'] === 'bundle') {
+    $env['PATH'] = VMM_ROOT . '/vendor/grub2-bhyve:' . ($env['PATH'] ?? '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin');
+}
+
+// destroying a VM fails when backup tools (znapzend/zrepl) hold its snapshots
+if ($verb === 'destroy') {
+    $ds = vmm_dataset_for_vm($name);
+    if ($ds !== '') {
+        joblog($log, 'checking zfs holds on ' . $ds);
+        $released = vmm_release_holds($ds);
+        foreach ($released as $r) {
+            joblog($log, 'released hold: ' . $r);
+        }
+        if ($released === []) {
+            joblog($log, 'no holds to release');
+        }
+    }
+}
+
+$cmd = array_merge([$vm['path']], $argvVm);
+$spec = [
+    0 => ['pipe', 'r'],
+    1 => ['pipe', 'w'],
+    2 => ['pipe', 'w'],
+];
+$proc = proc_open($cmd, $spec, $pipes, null, $env);
+if (!is_resource($proc)) {
+    $job['state'] = 'failed';
+    $job['error'] = 'proc_open failed';
+    $job['ended'] = time();
+    vmm_job_write($job);
+    flock($lock, LOCK_UN);
+    fclose($lock);
+    fclose($log);
+    exit(5);
+}
+fclose($pipes[0]);
+stream_set_blocking($pipes[1], false);
+stream_set_blocking($pipes[2], false);
+
+$timeout = (int)($job['timeout'] ?? 0);
+if ($timeout <= 0) {
+    $timeout = (int)($action['timeout'] ?? 300);
+}
+$start = time();
+$timedOut = false;
+$cancelFile = VMM_JOBDIR . '/' . $id . '.cancel';
+
+while (true) {
+    $status = proc_get_status($proc);
+    $out = (string)stream_get_contents($pipes[1]);
+    $err = (string)stream_get_contents($pipes[2]);
+    if ($out !== '') {
+        fwrite($log, $out);
+        fflush($log);
+    }
+    if ($err !== '') {
+        fwrite($log, $err);
+        fflush($log);
+    }
+    if (!$status['running']) {
+        break;
+    }
+    if (is_file($cancelFile)) {
+        joblog($log, 'cancel requested, sending TERM');
+        proc_terminate($proc, 15);
+        usleep(300000);
+        if (proc_get_status($proc)['running']) {
+            proc_terminate($proc, 9);
+        }
+        @unlink($cancelFile);
+        break;
+    }
+    if (time() - $start > $timeout) {
+        $timedOut = true;
+        joblog($log, "timeout after {$timeout}s, sending TERM");
+        proc_terminate($proc, 15);
+        usleep(500000);
+        if (proc_get_status($proc)['running']) {
+            proc_terminate($proc, 9);
+        }
+        break;
+    }
+    usleep(200000);
+}
+
+fwrite($log, (string)stream_get_contents($pipes[1]));
+fwrite($log, (string)stream_get_contents($pipes[2]));
+fclose($pipes[1]);
+fclose($pipes[2]);
+$rc = proc_close($proc);
+
+// the wizard may pick a switch; vm-bhyve takes it from the template, so patch it in
+if ($verb === 'create' && !empty($job['switch'])) {
+    $conf = vmm_vm_conf_path($name);
+    if ($conf !== '' && is_file($conf)) {
+        $text = (string)file_get_contents($conf);
+        $want = 'network0_switch="' . $job['switch'] . '"';
+        if (preg_match('/^network0_switch="[^"]*"/m', $text)) {
+            $text = preg_replace('/^network0_switch="[^"]*"/m', $want, $text, 1);
+        } else {
+            $text = rtrim($text) . "\n" . $want . "\n";
+        }
+        if (file_put_contents($conf, $text) !== false) {
+            joblog($log, 'network0_switch set to ' . $job['switch']);
+        }
+    }
+}
+
+// optional: attach the chosen ISO and boot right away
+if ($verb === 'create' && $rc === 0 && empty($timedOut)) {
+    $isos = [];
+    foreach (['iso', 'driver_iso'] as $key) {
+        if (!empty($job[$key])) {
+            $isos[] = (string)$job[$key];
+        }
+    }
+    if ($isos !== []) {
+        $att = vmm_iso_attach($name, $isos);
+        if (isset($att['error'])) {
+            joblog($log, 'iso attach failed: ' . $att['error']);
+        } else {
+            foreach ($isos as $isoPath) {
+                joblog($log, 'iso attached: ' . basename($isoPath));
+            }
+        }
+    }
+    if (!empty($job['autostart']) && !empty($job['iso'])) {
+        joblog($log, 'starting guest');
+        $start = vmm_run(['start', $name], 180);
+        if ($start['stdout'] !== '') {
+            fwrite($log, $start['stdout']);
+        }
+        joblog($log, 'start rc=' . $start['rc']);
+    }
+}
+
+// vm-bhyve often returns 0 even when it refused the operation, so the
+// resulting state is what counts. Some states are transitional (a guest that
+// just booted reports "bootloader" for a moment), so wait a little.
+$accept = [
+    'start' => ['running', 'bootloader', 'starting'],
+    'stop' => ['stopped'],
+    'restart' => ['running', 'bootloader', 'starting'],
+    'reset' => ['running', 'bootloader'],
+    'poweroff' => ['stopped'],
+    'destroy' => ['absent'],
+    'create' => ['stopped'],
+    'install' => ['stopped'],
+][$verb] ?? [];
+
+// a graceful stop can take a while (ACPI), and vm-bhyve reports "locked" while
+// it works - never treat that as the final state
+$waitFor = ['stop' => 180, 'poweroff' => 120, 'start' => 60, 'restart' => 90, 'reset' => 60, 'create' => 60, 'install' => 60][$verb] ?? 30;
+$stateAfter = vmm_vm_state($name);
+$deadline = time() + $waitFor;
+while ($accept !== [] && !in_array($stateAfter, $accept, true) && time() < $deadline) {
+    usleep(500000);
+    $stateAfter = vmm_vm_state($name);
+}
+joblog($log, 'state after action: ' . $stateAfter);
+
+if (in_array($verb, ['stop', 'poweroff', 'destroy'], true)) {
+    vmm_console_stop($name);
+    vmm_novnc_stop($name);
+}
+
+$job['rc'] = $rc;
+$job['ended'] = time();
+$job['state_after'] = $stateAfter;
+if ($timedOut) {
+    $job['state'] = 'failed';
+    $job['error'] = 'timeout';
+} elseif ($rc !== 0) {
+    $job['state'] = 'failed';
+    $job['error'] = 'vm exited with code ' . $rc;
+} elseif ($accept !== [] && !in_array($stateAfter, $accept, true)) {
+    $job['state'] = 'failed';
+    $job['error'] = sprintf('unexpected state after %s: %s (expected %s)', $verb, $stateAfter, implode('/', $accept));
+} else {
+    $job['state'] = 'done';
+}
+vmm_job_write($job);
+joblog($log, sprintf('finished: rc=%d, state=%s', $rc, $stateAfter));
+
+flock($lock, LOCK_UN);
+fclose($lock);
+fclose($log);
+
+// FIFO retention: keep only the configured number of finished jobs
+$conf = vmm_config();
+vmm_job_prune((int)($conf['job_keep'] ?? 100));
+
+exit(0);

@@ -1,0 +1,324 @@
+#!/bin/sh
+#
+# vmm-init - installer / updater / self-heal / uninstaller for the
+#            XigmaNAS "VM Manager" extension (vmmngr).
+#
+# Usage:
+#   ./vmm-init -o            install (or reinstall in place)
+#   ./vmm-init -u            update (refresh links, keep state/logs/config)
+#   ./vmm-init -p            postinit / self-heal (called at boot)
+#   ./vmm-init -r --yes      uninstall (keeps VMs, images, datastores)
+#   ./vmm-init -s            status
+#
+# Design notes:
+#   * Nothing is mounted. Only symlinks are placed into the RAM/system tree,
+#     and only where the target does not already exist.
+#   * Persistent data (VMs, images, config) lives under /mnt and is never
+#     touched by install/update/remove.
+
+set -u
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+
+CWDIR=$(cd "$(dirname "$0")" && pwd -P)
+APPNAME="vmmngr"
+VERSION=$(cat "${CWDIR}/version.txt" 2>/dev/null || echo "unknown")
+WWW="/usr/local/www"
+WWWEXT="${WWW}/ext"
+LOGDIR="${CWDIR}/log"
+LOGFILE="${LOGDIR}/vmm-init.log"
+CONFDIR="${CWDIR}/gui/ext/${APPNAME}"
+LOG_MAX=1048576
+
+mkdir -p "${LOGDIR}"
+
+log() {
+	printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "${LOGFILE}" >&2
+}
+
+fail() {
+	log "ERROR: $*"
+	exit 1
+}
+
+rotate_log() {
+	if [ -f "${LOGFILE}" ]; then
+		size=$(stat -f %z "${LOGFILE}" 2>/dev/null || echo 0)
+		if [ "${size}" -gt "${LOG_MAX}" ]; then
+			mv -f "${LOGFILE}" "${LOGFILE}.old"
+		fi
+	fi
+}
+
+banner() {
+	echo "------------------------------------------------------------"
+	echo " VM Manager (${APPNAME}) ${VERSION}"
+	echo " ${1}"
+	echo "------------------------------------------------------------"
+}
+
+# ---------------------------------------------------------------- preflight
+preflight() {
+	[ "$(uname -m)" = "amd64" ] || fail "only amd64 is supported"
+	platform=$(cat /etc/platform 2>/dev/null || echo unknown)
+	case "${platform}" in
+		*livecd*|*liveusb*) fail "live media is not supported for extensions (platform: ${platform})" ;;
+	esac
+	[ -d "${CWDIR}" ] || fail "install directory ${CWDIR} is missing"
+	mkdir -p "${CWDIR}/state/jobs" "${CWDIR}/state/locks" "${CWDIR}/log" "${CWDIR}/backup" "${CWDIR}/templates"
+
+	free_kb=$(df -k "${CWDIR}" | awk 'NR==2 {print $4}')
+	if [ -n "${free_kb}" ] && [ "${free_kb}" -lt 1048576 ]; then
+		log "WARNING: less than 1 GB free on ${CWDIR}"
+	fi
+
+	if [ -d "${WWWEXT}/vm_bhyve" ]; then
+		log "WARNING: legacy extension 'vm_bhyve' found in ${WWWEXT} - remove it to avoid duplicate menu entries"
+	fi
+
+	vm_bin=""
+	if [ -x "/usr/local/sbin/vm" ] && [ ! -L "/usr/local/sbin/vm" ]; then
+		vm_bin="/usr/local/sbin/vm"
+		log "vm-bhyve: using system installation (${vm_bin})"
+	elif [ -x "${CWDIR}/vendor/vm-bhyve/sbin/vm" ]; then
+		vm_bin="${CWDIR}/vendor/vm-bhyve/sbin/vm"
+		log "vm-bhyve: system installation not found, bundle will be linked"
+	else
+		log "WARNING: neither /usr/local/sbin/vm nor a bundled vm-bhyve was found"
+	fi
+
+	ensure_kmods
+	ensure_loader_conf
+}
+
+# ---------------------------------------------------------------- kernel modules
+ensure_kmods() {
+	for mod in vmm nmdm; do
+		if kldstat -q -n "${mod}"; then
+			continue
+		fi
+		if kldload "${mod}" 2>/dev/null; then
+			log "kldload ${mod}: loaded"
+		elif kldstat -q -n "${mod}"; then
+			log "${mod} already present"
+		else
+			log "WARNING: could not load ${mod}.ko - bhyve will not work until it is loaded"
+		fi
+	done
+}
+
+ensure_loader_conf() {
+	# /boot/loader.conf.local is generated from /conf/config.xml at boot, so
+	# writing it here would not survive a reboot. Only report the state; the
+	# entries are registered through the GUI (Configuration > Register).
+	conf="/boot/loader.conf.local"
+	for key in vmm_load nmdm_load; do
+		if grep -q "^${key}=" "${conf}" 2>/dev/null; then
+			log "loader.conf.local: ${key} present"
+		else
+			log "HINT: ${key} missing - open Extensions > VM Manager > Configuration and press 'Register in config.xml'"
+		fi
+	done
+}
+
+# ---------------------------------------------------------------- symlinks
+link_force() {
+	# link_force <target> <link>
+	target="$1"
+	link="$2"
+	if [ -e "${link}" ] && [ ! -L "${link}" ]; then
+		log "keep existing regular file: ${link}"
+		return 0
+	fi
+	if [ -L "${link}" ] && [ "$(readlink "${link}")" = "${target}" ]; then
+		return 0
+	fi
+	mkdir -p "$(dirname "${link}")"
+	ln -sfn "${target}" "${link}" || fail "cannot link ${link} -> ${target}"
+	log "linked ${link} -> ${target}"
+}
+
+link_missing() {
+	# link_missing <target> <link>  (only if link does not exist at all)
+	target="$1"
+	link="$2"
+	if [ -e "${link}" ] || [ -L "${link}" ]; then
+		return 0
+	fi
+	mkdir -p "$(dirname "${link}")"
+	ln -sfn "${target}" "${link}" || fail "cannot link ${link} -> ${target}"
+	log "linked ${link} -> ${target}"
+}
+
+do_symlinks() {
+	mkdir -p "${WWWEXT}"
+	link_force "${CONFDIR}" "${WWWEXT}/${APPNAME}"
+
+	for f in "${CWDIR}"/gui/*.php "${CWDIR}"/gui/*.inc "${CWDIR}"/gui/*.js "${CWDIR}"/gui/*.css; do
+		[ -e "${f}" ] || continue
+		link_force "${f}" "${WWW}/$(basename "${f}")"
+	done
+
+	# CLI helper: only where nothing else lives
+	link_missing "${CWDIR}/bin/vmm-ctl" "/usr/local/sbin/vmm-ctl"
+	link_missing "${CWDIR}/bin/vmm-ctl" "/usr/local/bin/vmm-ctl"
+
+	# bundled components are only linked when the system lacks them
+	if [ ! -e "/usr/local/sbin/vm" ] && [ -e "${CWDIR}/vendor/vm-bhyve/sbin/vm" ]; then
+		mkdir -p /usr/local/lib
+		link_missing "${CWDIR}/vendor/vm-bhyve/sbin/vm" "/usr/local/sbin/vm"
+		link_missing "${CWDIR}/vendor/vm-bhyve/lib" "/usr/local/lib/vm-bhyve"
+		chmod 0555 "${CWDIR}/vendor/vm-bhyve/sbin/vm" 2>/dev/null
+	fi
+	if [ ! -e "/usr/local/sbin/grub-bhyve" ] && [ -e "${CWDIR}/vendor/grub2-bhyve/grub-bhyve" ]; then
+		link_missing "${CWDIR}/vendor/grub2-bhyve/grub-bhyve" "/usr/local/sbin/grub-bhyve"
+		chmod 0555 "${CWDIR}/vendor/grub2-bhyve/grub-bhyve" 2>/dev/null
+	fi
+	if [ ! -e "/usr/local/share/uefi-firmware/BHYVE_UEFI.fd" ] && [ -e "${CWDIR}/vendor/edk2-bhyve/BHYVE_UEFI.fd" ]; then
+		mkdir -p /usr/local/share/uefi-firmware
+		for fw in BHYVE_UEFI.fd BHYVE_UEFI_CODE.fd BHYVE_UEFI_VARS.fd; do
+			[ -e "${CWDIR}/vendor/edk2-bhyve/${fw}" ] || continue
+			link_missing "${CWDIR}/vendor/edk2-bhyve/${fw}" "/usr/local/share/uefi-firmware/${fw}"
+		done
+	fi
+}
+
+# ---------------------------------------------------------------- helpers
+write_default_conf() {
+	conf="${CONFDIR}/vmmngr.conf"
+	[ -f "${conf}" ] && return 0
+	cat > "${conf}" <<EOF
+{
+    "appname": "VM Manager",
+    "version": "${VERSION}",
+    "rootfolder": "${CWDIR}",
+    "vm_source": "auto",
+    "bridges": [],
+    "default_bridge": "",
+    "enable": true,
+    "job_timeout": 900
+}
+EOF
+	log "created default configuration ${conf}"
+}
+
+set_permissions() {
+	chmod 0750 "${CWDIR}" 2>/dev/null
+	chmod 0555 "${CWDIR}/vmm-init" 2>/dev/null
+	find "${CWDIR}/bin" -type f -exec chmod 0555 {} \; 2>/dev/null
+	find "${CWDIR}/gui" -type f \( -name '*.php' -o -name '*.inc' \) -exec chmod 0644 {} \; 2>/dev/null
+	find "${CWDIR}/gui" -type f \( -name '*.js' -o -name '*.css' \) -exec chmod 0644 {} \; 2>/dev/null
+	chmod 0750 "${CWDIR}/state" "${CWDIR}/state/jobs" "${CWDIR}/state/locks" "${CWDIR}/log" "${CWDIR}/backup" 2>/dev/null
+}
+
+selfcheck() {
+	if [ -x "${CWDIR}/bin/vmm-ctl" ]; then
+		echo
+		echo "--- selfcheck ---"
+		"${CWDIR}/bin/vmm-ctl" selfcheck || log "selfcheck reported a problem"
+	fi
+}
+
+# ---------------------------------------------------------------- commands
+cmd_install() {
+	banner "install"
+	rotate_log
+	preflight
+	write_default_conf
+	set_permissions
+	do_symlinks
+	log "installed version ${VERSION}"
+	selfcheck
+	echo
+	echo "Open: Extensions > VM Manager"
+}
+
+cmd_update() {
+	banner "update"
+	rotate_log
+	preflight
+	if [ -d "${CWDIR}/backup" ]; then
+		ts=$(date '+%Y%m%d-%H%M%S')
+		mkdir -p "${CWDIR}/backup/${ts}"
+		for d in bin gui; do
+			[ -d "${CWDIR}/${d}" ] && cp -Rp "${CWDIR}/${d}" "${CWDIR}/backup/${ts}/" 2>/dev/null
+		done
+		log "backup written to ${CWDIR}/backup/${ts}"
+	fi
+	write_default_conf
+	set_permissions
+	do_symlinks
+	log "updated to version ${VERSION}"
+	selfcheck
+}
+
+cmd_postinit() {
+	# Runs at boot (rc postinit) on embedded systems. Must be quiet and fast,
+	# and must not touch the config when nothing is missing.
+	rotate_log
+	ensure_kmods
+	do_symlinks
+}
+
+cmd_status() {
+	banner "status"
+	echo "version  : ${VERSION}"
+	echo "root     : ${CWDIR}"
+	echo
+	for l in "${WWWEXT}/${APPNAME}" "${WWW}/vmmngr.php"; do
+		if [ -L "${l}" ]; then
+			echo "link ok  : ${l} -> $(readlink "${l}")"
+		elif [ -e "${l}" ]; then
+			echo "present  : ${l}"
+		else
+			echo "MISSING  : ${l}"
+		fi
+	done
+	[ -f "/usr/local/sbin/vmm-ctl" ] && echo "cli      : /usr/local/sbin/vmm-ctl"
+	selfcheck
+}
+
+cmd_remove() {
+	if [ "${1:-}" != "--yes" ]; then
+		echo "refusing to uninstall without --yes"
+		echo "usage: $0 -r --yes"
+		exit 2
+	fi
+	banner "uninstall"
+	rm -f "${WWWEXT}/${APPNAME}"
+	for f in "${CWDIR}"/gui/*.php "${CWDIR}"/gui/*.inc "${CWDIR}"/gui/*.js "${CWDIR}"/gui/*.css; do
+		[ -e "${f}" ] || continue
+		lnk="${WWW}/$(basename "${f}")"
+		if [ -L "${lnk}" ] && [ "$(readlink "${lnk}")" = "${f}" ]; then
+			rm -f "${lnk}"
+		fi
+	done
+	for l in /usr/local/sbin/vmm-ctl /usr/local/bin/vmm-ctl; do
+		if [ -L "${l}" ] && [ "$(readlink "${l}")" = "${CWDIR}/bin/vmm-ctl" ]; then
+			rm -f "${l}"
+		fi
+	done
+	mkdir -p /mnt/.recycle 2>/dev/null
+	dest="/mnt/.recycle/${APPNAME}-$(date '+%Y%m%d-%H%M%S')"
+	mv "${CWDIR}" "${dest}" && log "moved to ${dest}"
+	echo "Removed. VMs, images and datastores were not touched."
+}
+
+case "${1:-}" in
+	-o|--install) cmd_install ;;
+	-u|--update) cmd_update ;;
+	-p|--postinit) cmd_postinit ;;
+	-s|--status) cmd_status ;;
+	-r|--remove) shift; cmd_remove "${1:-}" ;;
+	-h|--help|"")
+		sed -n '2,20p' "$0"
+		;;
+	*)
+		echo "unknown option: $1" >&2
+		sed -n '2,20p' "$0" >&2
+		exit 2
+		;;
+esac
