@@ -37,6 +37,7 @@ mkdir -p "${STAGE}" dist
 # our code and documentation
 cp -R bin gui templates "${STAGE}/"
 cp vmm-init version.txt README.md CHANGELOG.md THIRD-PARTY.md LICENSE "${STAGE}/"
+if [ -d docs ]; then cp -R docs "${STAGE}/"; fi
 
 if [ "${WITH_VENDOR}" -eq 1 ] && [ -d vendor ]; then
 	mkdir -p "${STAGE}/vendor"

@@ -38,6 +38,28 @@ system installation and only fills gaps from the bundled tree.
 
 ## Install
 
+### From the release page (recommended)
+
+Every release ships a ready package:
+
+- `vmmngr-<version>.tar.gz` - the extension
+- `vmmngr-latest.tar.gz` - same file with a stable name (used by the OBI entry)
+- `*.sha256` - checksums
+
+```sh
+mkdir -p -m 0750 /mnt/tank/extensions/vmmngr && cd /mnt/tank/extensions/vmmngr
+fetch https://github.com/macmattes/vmmngr/releases/latest/download/vmmngr-latest.tar.gz
+tar xzf vmmngr-latest.tar.gz --strip-components 1
+chmod +x vmm-init && ./vmm-init -o
+```
+
+### Through OneButtonInstaller
+
+See [`docs/onebutton.md`](docs/onebutton.md) - includes the ready-made
+`extensions.txt` line.
+
+### From source
+
 ```sh
 mkdir -p -m 0750 /mnt/tank/extensions/vmmngr && cd /mnt/tank/extensions/vmmngr
 fetch https://raw.githubusercontent.com/yourname/vmmngr/main/vmm-init
